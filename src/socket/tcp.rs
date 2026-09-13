@@ -21,7 +21,7 @@ use crate::wire::{
     IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpRepr, TCP_HEADER_LEN, TcpControl,
     TcpRepr, TcpSeqNumber, TcpTimestampGenerator, TcpTimestampRepr,
 };
-pub use storage::{Buffer, TcpContext};
+pub use storage::{Buffer, ContiguousBuffer, TcpContext};
 
 mod congestion;
 
@@ -599,6 +599,10 @@ impl<'a, B: Buffer> Socket<'a, B> {
             .window_shift()
             .unwrap_or(rx_cap_log2.saturating_sub(16) as u8);
 
+        // SAFETY: TCP's window scale field is limited to 14; custom storage
+        // must obey the same sequence-space limit as the standard ring buffer.
+        assert!(window_shift <= 14, "TCP window scale exceeds 14");
+
         Socket {
             storage_lifetime: core::marker::PhantomData,
             state: State::Closed,
@@ -776,7 +780,18 @@ impl<'a, B: Buffer> Socket<'a, B> {
     /// Used in internal calculations as well as packet generation.
     #[inline]
     fn scaled_window(&self) -> u16 {
-        u16::try_from(self.rx_buffer.window() >> self.remote_win_shift).unwrap_or(u16::MAX)
+        let requested = self.rx_buffer.window();
+        let floor = self
+            .remote_last_ack
+            .filter(|_| self.rx_buffer.window_shift().is_some())
+            .map_or(0, |ack| {
+                let end = ack + ((self.remote_last_win as usize) << self.remote_win_shift);
+                let next = self.remote_seq_no + self.rx_buffer.len();
+                if end > next { end - next } else { 0 }
+            });
+        let quantum = 1usize << self.remote_win_shift;
+        let units = (requested >> self.remote_win_shift).max(floor.div_ceil(quantum));
+        u16::try_from(units).unwrap_or(u16::MAX)
     }
 
     /// Return the last window field value, including scaling according to RFC 1323.
@@ -1301,6 +1316,7 @@ impl<'a, B: Buffer> Socket<'a, B> {
     pub fn send<'b, F, R>(&'b mut self, f: F) -> Result<R, SendError>
     where
         F: FnOnce(&'b mut [u8]) -> (usize, R),
+        B: ContiguousBuffer,
     {
         self.send_buffer(|tx_buffer| tx_buffer.enqueue_many_with(f))
     }
@@ -1367,6 +1383,7 @@ impl<'a, B: Buffer> Socket<'a, B> {
     pub fn recv<'b, F, R>(&'b mut self, f: F) -> Result<R, RecvError>
     where
         F: FnOnce(&'b mut [u8]) -> (usize, R),
+        B: ContiguousBuffer,
     {
         self.recv_buffer(|rx_buffer| rx_buffer.dequeue_many_with(f))
     }
@@ -2846,7 +2863,14 @@ impl<'a, B: Buffer> Socket<'a, B> {
             .remote_last_seq
             .max(repr.seq_number + repr.segment_len());
         self.remote_last_ack = repr.ack_number;
-        self.remote_last_win = repr.window_len;
+        self.remote_last_win =
+            if repr.control == TcpControl::Syn && self.rx_buffer.window_shift().is_some() {
+                // SYN windows are unscaled on the wire. Store the same units as
+                // later advertisements so the first ACK cannot inflate the window.
+                repr.window_len >> self.remote_win_shift
+            } else {
+                repr.window_len
+            };
 
         if repr.segment_len() > 0 {
             self.rtte

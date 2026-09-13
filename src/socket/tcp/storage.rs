@@ -21,14 +21,6 @@ pub trait Buffer {
     fn window_shift(&self) -> Option<u8> {
         None
     }
-    fn enqueue_many_with<'b, R, F: FnOnce(&'b mut [u8]) -> (usize, R)>(
-        &'b mut self,
-        f: F,
-    ) -> (usize, R);
-    fn dequeue_many_with<'b, R, F: FnOnce(&'b mut [u8]) -> (usize, R)>(
-        &'b mut self,
-        f: F,
-    ) -> (usize, R);
     fn enqueue_slice(&mut self, data: &[u8]) -> usize;
     fn dequeue_slice(&mut self, data: &mut [u8]) -> usize;
     fn get_allocated(&self, offset: usize, size: usize) -> &[u8];
@@ -47,18 +39,6 @@ impl Buffer for RingBuffer<'_, u8> {
     }
     fn clear(&mut self) {
         self.clear()
-    }
-    fn enqueue_many_with<'b, R, F: FnOnce(&'b mut [u8]) -> (usize, R)>(
-        &'b mut self,
-        f: F,
-    ) -> (usize, R) {
-        self.enqueue_many_with(f)
-    }
-    fn dequeue_many_with<'b, R, F: FnOnce(&'b mut [u8]) -> (usize, R)>(
-        &'b mut self,
-        f: F,
-    ) -> (usize, R) {
-        self.dequeue_many_with(f)
     }
     fn enqueue_slice(&mut self, data: &[u8]) -> usize {
         self.enqueue_slice(data)
@@ -122,5 +102,32 @@ impl TcpContext for crate::iface::Context {
     }
     fn get_source_address(&self, destination: &IpAddress) -> Option<IpAddress> {
         self.get_source_address(destination)
+    }
+}
+
+/// Optional contiguous mutable access for the conventional socket API.
+pub trait ContiguousBuffer: Buffer {
+    fn enqueue_many_with<'b, R, F: FnOnce(&'b mut [u8]) -> (usize, R)>(
+        &'b mut self,
+        f: F,
+    ) -> (usize, R);
+    fn dequeue_many_with<'b, R, F: FnOnce(&'b mut [u8]) -> (usize, R)>(
+        &'b mut self,
+        f: F,
+    ) -> (usize, R);
+}
+
+impl ContiguousBuffer for RingBuffer<'_, u8> {
+    fn enqueue_many_with<'b, R, F: FnOnce(&'b mut [u8]) -> (usize, R)>(
+        &'b mut self,
+        f: F,
+    ) -> (usize, R) {
+        self.enqueue_many_with(f)
+    }
+    fn dequeue_many_with<'b, R, F: FnOnce(&'b mut [u8]) -> (usize, R)>(
+        &'b mut self,
+        f: F,
+    ) -> (usize, R) {
+        self.dequeue_many_with(f)
     }
 }
