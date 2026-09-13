@@ -506,6 +506,9 @@ pub struct Socket<'a, B = SocketBuffer<'a>> {
     remote_last_ack: Option<TcpSeqNumber>,
     /// The last window length sent.
     remote_last_win: u16,
+    /// Largest receive right edge promised by custom storage. Keep byte precision
+    /// across window-scale quantization and reductions of the storage target.
+    receive_window_end: Option<TcpSeqNumber>,
     /// The sending window scaling factor advertised to remotes which support RFC 1323.
     /// It is zero if the window <= 64KiB and/or the remote does not support it.
     remote_win_shift: u8,
@@ -622,6 +625,7 @@ impl<'a, B: Buffer> Socket<'a, B> {
             remote_last_seq: TcpSeqNumber::default(),
             remote_last_ack: None,
             remote_last_win: 0,
+            receive_window_end: None,
             remote_win_len: 0,
             remote_win_shift: window_shift,
             remote_win_scale: None,
@@ -781,16 +785,14 @@ impl<'a, B: Buffer> Socket<'a, B> {
     #[inline]
     fn scaled_window(&self) -> u16 {
         let requested = self.rx_buffer.window();
-        let floor = self
-            .remote_last_ack
-            .filter(|_| self.rx_buffer.window_shift().is_some())
-            .map_or(0, |ack| {
-                let end = ack + ((self.remote_last_win as usize) << self.remote_win_shift);
-                let next = self.remote_seq_no + self.rx_buffer.len();
-                if end > next { end - next } else { 0 }
-            });
-        let quantum = 1usize << self.remote_win_shift;
-        let units = (requested >> self.remote_win_shift).max(floor.div_ceil(quantum));
+        let floor = self.receive_window_end.map_or(0, |end| {
+            let next = self.remote_seq_no + self.rx_buffer.len();
+            if end > next { end - next } else { 0 }
+        });
+        // Rounding up on every ACK would keep extending the right edge when
+        // a stalled reader receives sub-quantum segments. Retain old promises
+        // separately and round the wire field down, as required by scaling.
+        let units = requested.max(floor) >> self.remote_win_shift;
         u16::try_from(units).unwrap_or(u16::MAX)
     }
 
@@ -808,7 +810,8 @@ impl<'a, B: Buffer> Socket<'a, B> {
         let next_ack = self.remote_seq_no + self.rx_buffer.len();
 
         let last_win = (self.remote_last_win as usize) << self.remote_win_shift;
-        let last_win_adjusted = last_ack + last_win - next_ack;
+        let end = last_ack + last_win;
+        let last_win_adjusted = if end > next_ack { end - next_ack } else { 0 };
 
         Some(u16::try_from(last_win_adjusted >> self.remote_win_shift).unwrap_or(u16::MAX))
     }
@@ -948,6 +951,7 @@ impl<'a, B: Buffer> Socket<'a, B> {
         self.remote_last_seq = TcpSeqNumber::default();
         self.remote_last_ack = None;
         self.remote_last_win = 0;
+        self.receive_window_end = None;
         self.remote_win_len = 0;
         self.remote_win_scale = None;
         self.remote_win_shift = self
@@ -1522,13 +1526,19 @@ impl<'a, B: Buffer> Socket<'a, B> {
         // to be received.
         reply_repr.seq_number = self.remote_last_seq;
         reply_repr.ack_number = Some(self.remote_seq_no + self.rx_buffer.len());
-        self.remote_last_ack = reply_repr.ack_number;
 
         // From RFC 1323:
         // The window field [...] of every outgoing segment, with the exception of SYN
         // segments, is right-shifted by [advertised scale value] bits[...]
         reply_repr.window_len = self.scaled_window();
+        self.remote_last_ack = reply_repr.ack_number;
         self.remote_last_win = reply_repr.window_len;
+        if self.rx_buffer.window_shift().is_some() {
+            let end = self.remote_seq_no
+                + self.rx_buffer.len()
+                + ((reply_repr.window_len as usize) << self.remote_win_shift);
+            self.receive_window_end = Some(self.receive_window_end.map_or(end, |old| old.max(end)));
+        }
 
         // If the remote supports selective acknowledgement, add the option to the outgoing
         // segment.
@@ -1742,7 +1752,9 @@ impl<'a, B: Buffer> Socket<'a, B> {
         }
 
         let window_start = self.remote_seq_no + self.rx_buffer.len();
-        let window_end = if let Some(last_ack) = self.remote_last_ack {
+        let window_end = if let Some(end) = self.receive_window_end {
+            end.max(window_start)
+        } else if let Some(last_ack) = self.remote_last_ack {
             last_ack + ((self.remote_last_win as usize) << self.remote_win_shift)
         } else {
             window_start
@@ -2864,6 +2876,17 @@ impl<'a, B: Buffer> Socket<'a, B> {
             .remote_last_seq
             .max(repr.seq_number + repr.segment_len());
         self.remote_last_ack = repr.ack_number;
+        if self.rx_buffer.window_shift().is_some()
+            && let Some(ack) = repr.ack_number
+        {
+            let shift = if repr.control == TcpControl::Syn {
+                0
+            } else {
+                self.remote_win_shift
+            };
+            let end = ack + ((repr.window_len as usize) << shift);
+            self.receive_window_end = Some(self.receive_window_end.map_or(end, |old| old.max(end)));
+        }
         self.remote_last_win =
             if repr.control == TcpControl::Syn && self.rx_buffer.window_shift().is_some() {
                 // SYN windows are unscaled on the wire. Store the same units as
