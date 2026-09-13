@@ -163,6 +163,9 @@ pub(crate) mod segmentation_offload {
 
     use super::{RxToken, TestingDevice, setup_with_device};
 
+    #[cfg(not(feature = "medium-ethernet"))]
+    const ETHERNET_HEADER_LEN: usize = 0;
+
     // The value is chosen to allow dispatching unsegmented packets whose sizes
     // exceed the length field in the IP header.
     pub const MAX_SEGMENTABLE_SIZE: usize =

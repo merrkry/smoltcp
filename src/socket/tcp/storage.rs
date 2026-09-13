@@ -24,6 +24,11 @@ pub trait Buffer {
     fn enqueue_slice(&mut self, data: &[u8]) -> usize;
     fn dequeue_slice(&mut self, data: &mut [u8]) -> usize;
     fn get_allocated(&self, offset: usize, size: usize) -> &[u8];
+    /// Prepare one wire segment. Segmented storage can join a block boundary
+    /// here so allocation layout does not produce short TCP segments.
+    fn get_segment(&mut self, offset: usize, size: usize) -> &[u8] {
+        self.get_allocated(offset, size)
+    }
     fn read_allocated(&mut self, offset: usize, data: &mut [u8]) -> usize;
     fn write_unallocated(&mut self, offset: usize, data: &[u8]) -> usize;
     fn enqueue_unallocated(&mut self, count: usize);

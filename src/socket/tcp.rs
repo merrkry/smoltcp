@@ -2594,6 +2594,7 @@ impl<'a, B: Buffer> Socket<'a, B> {
 
         // Construct the basic TCP representation, an empty ACK packet.
         // We'll adjust this to be more specific as needed.
+        let queued_bytes = self.tx_buffer.len();
         let mut repr = TcpRepr {
             src_port: tuple.local.port,
             dst_port: tuple.remote.port,
@@ -2672,7 +2673,7 @@ impl<'a, B: Buffer> Socket<'a, B> {
                 let offset = if self.pending_fast_retransmit {
                     let size = effective_mss.min(self.tx_buffer.len());
                     repr.seq_number = self.local_seq_no;
-                    repr.payload = self.tx_buffer.get_allocated(0, size);
+                    repr.payload = self.tx_buffer.get_segment(0, size);
 
                     self.pending_fast_retransmit = false;
 
@@ -2744,7 +2745,7 @@ impl<'a, B: Buffer> Socket<'a, B> {
                     };
 
                     let offset = self.flight_size();
-                    repr.payload = self.tx_buffer.get_allocated(offset, size);
+                    repr.payload = self.tx_buffer.get_segment(offset, size);
 
                     #[cfg(feature = "segmentation-offload")]
                     if repr.payload.len() > effective_mss {
@@ -2759,7 +2760,7 @@ impl<'a, B: Buffer> Socket<'a, B> {
 
                 // If we've sent everything we had in the buffer, follow it with the PSH or FIN
                 // flags, depending on whether the transmit half of the connection is open.
-                if offset + repr.payload.len() == self.tx_buffer.len() {
+                if offset + repr.payload.len() == queued_bytes {
                     match self.state {
                         State::FinWait1 | State::LastAck | State::Closing => {
                             repr.control = TcpControl::Fin
@@ -2796,7 +2797,7 @@ impl<'a, B: Buffer> Socket<'a, B> {
             tcp_trace!(
                 "tx buffer: sending {} octets at offset {}",
                 repr.payload.len(),
-                self.flight_size()
+                self.remote_last_seq - self.local_seq_no
             );
         }
         if repr.control != TcpControl::None || repr.payload.is_empty() {
@@ -7624,6 +7625,8 @@ mod test {
             ..socket_listen()
         };
         s.tx_buffer = SocketBuffer::new(vec![0; 2 * MAX_SEGMENTABLE_SIZE]);
+        // Test the offload size limit independently of the initial congestion window.
+        s.set_congestion_control(CongestionControl::None);
 
         send!(
             s,
