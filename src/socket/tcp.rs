@@ -8,15 +8,20 @@ use core::task::Waker;
 use core::{fmt, mem};
 
 use crate::phy::PacketMeta;
+#[cfg(test)]
+use crate::socket::Context;
+use crate::socket::PollAt;
 #[cfg(feature = "async")]
 use crate::socket::WakerRegistration;
-use crate::socket::{Context, PollAt};
+
+mod storage;
 use crate::storage::{Assembler, RingBuffer};
 use crate::time::{Duration, Instant};
 use crate::wire::{
     IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpRepr, TCP_HEADER_LEN, TcpControl,
     TcpRepr, TcpSeqNumber, TcpTimestampGenerator, TcpTimestampRepr,
 };
+pub use storage::{Buffer, TcpContext};
 
 mod congestion;
 
@@ -467,14 +472,15 @@ pub enum CongestionControl {
 /// accept several connections, as many sockets must be allocated, or any new connection
 /// attempts will be reset.
 #[derive(Debug)]
-pub struct Socket<'a> {
+pub struct Socket<'a, B = SocketBuffer<'a>> {
+    storage_lifetime: core::marker::PhantomData<&'a mut [u8]>,
     state: State,
     timer: Timer,
     rtte: RttEstimator,
     assembler: Assembler,
-    rx_buffer: SocketBuffer<'a>,
+    rx_buffer: B,
     rx_fin_received: bool,
-    tx_buffer: SocketBuffer<'a>,
+    tx_buffer: B,
     /// Interval after which, if no inbound packets are received, the connection is aborted.
     timeout: Option<Duration>,
     /// Interval at which keep-alive packets will be sent.
@@ -567,13 +573,16 @@ const DEFAULT_MSS: usize = 536;
 const MIN_REMOTE_MSS: usize = 48;
 
 impl<'a> Socket<'a> {
-    #[allow(unused_comparisons)] // small usize platforms always pass rx_capacity check
-    /// Create a socket using the given buffers.
-    pub fn new<T>(rx_buffer: T, tx_buffer: T) -> Socket<'a>
-    where
-        T: Into<SocketBuffer<'a>>,
-    {
-        let (rx_buffer, tx_buffer) = (rx_buffer.into(), tx_buffer.into());
+    /// Create a socket with the standard borrowed or owned ring buffers.
+    pub fn new<T: Into<SocketBuffer<'a>>>(rx: T, tx: T) -> Self {
+        Self::with_buffers(rx.into(), tx.into())
+    }
+}
+
+impl<'a, B: Buffer> Socket<'a, B> {
+    /// Create a socket with application-supplied storage. Buffer contracts are
+    /// identical for standalone driving and Interface-based driving.
+    pub fn with_buffers(rx_buffer: B, tx_buffer: B) -> Self {
         let rx_capacity = rx_buffer.capacity();
 
         // From RFC 1323:
@@ -586,7 +595,12 @@ impl<'a> Socket<'a> {
         }
         let rx_cap_log2 = mem::size_of::<usize>() * 8 - rx_capacity.leading_zeros() as usize;
 
+        let window_shift = rx_buffer
+            .window_shift()
+            .unwrap_or(rx_cap_log2.saturating_sub(16) as u8);
+
         Socket {
+            storage_lifetime: core::marker::PhantomData,
             state: State::Closed,
             timer: Timer::new(),
             rtte: RttEstimator::default(),
@@ -605,7 +619,7 @@ impl<'a> Socket<'a> {
             remote_last_ack: None,
             remote_last_win: 0,
             remote_win_len: 0,
-            remote_win_shift: rx_cap_log2.saturating_sub(16) as u8,
+            remote_win_shift: window_shift,
             remote_win_scale: None,
             remote_has_sack: false,
             remote_mss: DEFAULT_MSS,
@@ -921,7 +935,10 @@ impl<'a> Socket<'a> {
         self.remote_last_win = 0;
         self.remote_win_len = 0;
         self.remote_win_scale = None;
-        self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
+        self.remote_win_shift = self
+            .rx_buffer
+            .window_shift()
+            .unwrap_or(rx_cap_log2.saturating_sub(16) as u8);
         self.remote_mss = DEFAULT_MSS;
         self.remote_last_ts = None;
         self.ack_delay_timer = AckDelayTimer::Idle;
@@ -1012,7 +1029,7 @@ impl<'a> Socket<'a> {
     /// is unspecified.
     pub fn connect<T, U>(
         &mut self,
-        cx: &mut Context,
+        cx: &mut impl TcpContext,
         remote_endpoint: T,
         local_endpoint: U,
     ) -> Result<(), ConnectError>
@@ -1067,13 +1084,13 @@ impl<'a> Socket<'a> {
     }
 
     #[cfg(test)]
-    fn random_seq_no(_cx: &mut Context) -> TcpSeqNumber {
+    fn random_seq_no(_cx: &mut impl TcpContext) -> TcpSeqNumber {
         TcpSeqNumber(10000)
     }
 
     #[cfg(not(test))]
-    fn random_seq_no(cx: &mut Context) -> TcpSeqNumber {
-        TcpSeqNumber(cx.rand().rand_u32() as i32)
+    fn random_seq_no(cx: &mut impl TcpContext) -> TcpSeqNumber {
+        TcpSeqNumber(cx.random_u32() as i32)
     }
 
     /// Close the transmit half of the full-duplex connection.
@@ -1235,9 +1252,11 @@ impl<'a> Socket<'a> {
         !self.rx_buffer.is_empty()
     }
 
-    fn send_impl<'b, F, R>(&'b mut self, f: F) -> Result<R, SendError>
+    /// Enqueue through custom storage, returning exactly the number appended.
+    /// The callback must preserve all existing bytes and buffer accounting.
+    pub fn send_buffer<'b, F, R>(&'b mut self, f: F) -> Result<R, SendError>
     where
-        F: FnOnce(&'b mut SocketBuffer<'a>) -> (usize, R),
+        F: FnOnce(&'b mut B) -> (usize, R),
     {
         if !self.may_send() {
             return Err(SendError::InvalidState);
@@ -1283,7 +1302,7 @@ impl<'a> Socket<'a> {
     where
         F: FnOnce(&'b mut [u8]) -> (usize, R),
     {
-        self.send_impl(|tx_buffer| tx_buffer.enqueue_many_with(f))
+        self.send_buffer(|tx_buffer| tx_buffer.enqueue_many_with(f))
     }
 
     /// Enqueue a sequence of octets to be sent, and fill it from a slice.
@@ -1293,7 +1312,7 @@ impl<'a> Socket<'a> {
     ///
     /// See also [send](#method.send).
     pub fn send_slice(&mut self, data: &[u8]) -> Result<usize, SendError> {
-        self.send_impl(|tx_buffer| {
+        self.send_buffer(|tx_buffer| {
             let size = tx_buffer.enqueue_slice(data);
             (size, size)
         })
@@ -1313,9 +1332,11 @@ impl<'a> Socket<'a> {
         Ok(())
     }
 
-    fn recv_impl<'b, F, R>(&'b mut self, f: F) -> Result<R, RecvError>
+    /// Consume through custom storage, returning exactly the number removed.
+    /// The callback must preserve unconsumed and out-of-order bytes.
+    pub fn recv_buffer<'b, F, R>(&'b mut self, f: F) -> Result<R, RecvError>
     where
-        F: FnOnce(&'b mut SocketBuffer<'a>) -> (usize, R),
+        F: FnOnce(&'b mut B) -> (usize, R),
     {
         self.recv_error_check()?;
 
@@ -1347,7 +1368,7 @@ impl<'a> Socket<'a> {
     where
         F: FnOnce(&'b mut [u8]) -> (usize, R),
     {
-        self.recv_impl(|rx_buffer| rx_buffer.dequeue_many_with(f))
+        self.recv_buffer(|rx_buffer| rx_buffer.dequeue_many_with(f))
     }
 
     /// Dequeue a sequence of received octets, and fill a slice from it.
@@ -1357,7 +1378,7 @@ impl<'a> Socket<'a> {
     ///
     /// See also [recv](#method.recv).
     pub fn recv_slice(&mut self, data: &mut [u8]) -> Result<usize, RecvError> {
-        self.recv_impl(|rx_buffer| {
+        self.recv_buffer(|rx_buffer| {
             let size = rx_buffer.dequeue_slice(data);
             (size, size)
         })
@@ -1456,7 +1477,7 @@ impl<'a> Socket<'a> {
         (ip_reply_repr, reply_repr)
     }
 
-    pub(crate) fn rst_reply(ip_repr: &IpRepr, repr: &TcpRepr) -> (IpRepr, TcpRepr<'static>) {
+    pub fn rst_reply(ip_repr: &IpRepr, repr: &TcpRepr) -> (IpRepr, TcpRepr<'static>) {
         debug_assert!(repr.control != TcpControl::Rst);
 
         let (ip_reply_repr, mut reply_repr) = Self::reply(ip_repr, repr);
@@ -1538,7 +1559,7 @@ impl<'a> Socket<'a> {
 
     fn challenge_ack_reply(
         &mut self,
-        cx: &mut Context,
+        cx: &mut impl TcpContext,
         ip_repr: &IpRepr,
         repr: &TcpRepr,
     ) -> Option<(IpRepr, TcpRepr<'static>)> {
@@ -1552,7 +1573,7 @@ impl<'a> Socket<'a> {
         Some(self.ack_reply(ip_repr, repr))
     }
 
-    pub(crate) fn accepts(&self, _cx: &mut Context, ip_repr: &IpRepr, repr: &TcpRepr) -> bool {
+    pub fn accepts(&self, _cx: &mut impl TcpContext, ip_repr: &IpRepr, repr: &TcpRepr) -> bool {
         if self.state == State::Closed {
             return false;
         }
@@ -1582,9 +1603,9 @@ impl<'a> Socket<'a> {
         }
     }
 
-    pub(crate) fn process(
+    pub fn process(
         &mut self,
-        cx: &mut Context,
+        cx: &mut impl TcpContext,
         ip_repr: &IpRepr,
         repr: &TcpRepr,
     ) -> Option<(IpRepr, TcpRepr<'static>)> {
@@ -2296,7 +2317,7 @@ impl<'a> Socket<'a> {
         }
     }
 
-    fn seq_to_transmit(&self, cx: &mut Context) -> bool {
+    fn seq_to_transmit(&self, cx: &mut impl TcpContext) -> bool {
         // Fast retransmits should always send, even if later congestion checks would disallow
         if self.pending_fast_retransmit && !self.tx_buffer.is_empty() {
             return true;
@@ -2430,9 +2451,9 @@ impl<'a> Socket<'a> {
         }
     }
 
-    pub(crate) fn dispatch<F, E>(&mut self, cx: &mut Context, emit: F) -> Result<(), E>
+    pub fn dispatch<C: TcpContext, F, E>(&mut self, cx: &mut C, emit: F) -> Result<(), E>
     where
-        F: FnOnce(&mut Context, PacketMeta, (IpRepr, TcpRepr)) -> Result<(), E>,
+        F: FnOnce(&mut C, PacketMeta, (IpRepr, TcpRepr)) -> Result<(), E>,
     {
         if self.tuple.is_none() {
             return Ok(());
@@ -2857,7 +2878,7 @@ impl<'a> Socket<'a> {
     }
 
     #[allow(clippy::if_same_then_else)]
-    pub(crate) fn poll_at(&self, cx: &mut Context) -> PollAt {
+    pub fn poll_at(&self, cx: &mut impl TcpContext) -> PollAt {
         // The logic here mirrors the beginning of dispatch() closely.
         if self.tuple.is_none() {
             // No one to talk to, nothing to transmit.
@@ -2901,7 +2922,7 @@ impl<'a> Socket<'a> {
     }
 }
 
-impl<'a> fmt::Write for Socket<'a> {
+impl<B: Buffer> fmt::Write for Socket<'_, B> {
     fn write_str(&mut self, slice: &str) -> fmt::Result {
         let slice = slice.as_bytes();
         if self.send_slice(slice) == Ok(slice.len()) {
