@@ -933,6 +933,39 @@ impl<'a, B: Buffer> Socket<'a, B> {
         self.state
     }
 
+    /// Return a safe local ISN for a new connection on this TIME-WAIT tuple.
+    ///
+    /// The incoming segment must be a bare SYN whose sequence follows every
+    /// octet, including FIN, accepted on the previous connection. Sequence
+    /// comparisons wrap in TCP sequence space. Unread payload prevents reuse.
+    /// This implements the sequence-number check described in RFC 6191 and
+    /// leaves this socket unchanged when an old duplicate SYN is received.
+    ///
+    /// The caller must create a separate connection using the returned ISN and
+    /// complete the old application's I/O before retiring this socket. The new
+    /// ISN follows the old FIN, as required by RFC 9293 section 3.6.1.
+    pub fn time_wait_reuse(&self, ip: &IpRepr, repr: &TcpRepr) -> Option<TcpSeqNumber> {
+        if self.state != State::TimeWait
+            || self.rx_buffer.len() != 0
+            || ip.next_header() != IpProtocol::Tcp
+            || repr.control != TcpControl::Syn
+            || repr.ack_number.is_some()
+            || !repr.payload.is_empty()
+            || repr.seq_number < self.remote_seq_no
+            || self.tuple
+                != Some(Tuple {
+                    local: IpEndpoint::new(ip.dst_addr(), repr.dst_port),
+                    remote: IpEndpoint::new(ip.src_addr(), repr.src_port),
+                })
+        {
+            return None;
+        }
+
+        // SAFETY: TIME-WAIT requires acknowledgment of our FIN and all preceding data.
+        debug_assert_eq!(self.tx_buffer.len(), 0);
+        Some(self.local_seq_no + 1)
+    }
+
     fn reset(&mut self) {
         let rx_cap_log2 =
             mem::size_of::<usize>() * 8 - self.rx_buffer.capacity().leading_zeros() as usize;
@@ -5896,6 +5929,130 @@ mod test {
     // =========================================================================================//
     // Tests for the TIME-WAIT state.
     // =========================================================================================//
+
+    #[test]
+    fn test_time_wait_reuse_preserves_sequence_boundaries_and_old_socket() {
+        let ip = IpRepr::new(
+            REMOTE_ADDR.into(),
+            LOCAL_ADDR.into(),
+            IpProtocol::Tcp,
+            20,
+            64,
+        );
+        for peer_end in [REMOTE_SEQ + 2, TcpSeqNumber(-1), TcpSeqNumber(i32::MAX)] {
+            let mut s = socket_time_wait(false);
+            s.remote_seq_no = peer_end;
+            s.local_seq_no = TcpSeqNumber(-1);
+            let timer = s.timer;
+            let syn = TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: peer_end + 65536,
+                ack_number: None,
+                ..SEND_TEMPL
+            };
+
+            assert_eq!(s.time_wait_reuse(&ip, &syn), Some(TcpSeqNumber(0)));
+            assert_eq!(
+                s.time_wait_reuse(
+                    &ip,
+                    &TcpRepr {
+                        seq_number: peer_end,
+                        ..syn
+                    }
+                ),
+                Some(TcpSeqNumber(0))
+            );
+            for stale in [peer_end - 1, peer_end - 65536] {
+                assert_eq!(
+                    s.time_wait_reuse(
+                        &ip,
+                        &TcpRepr {
+                            seq_number: stale,
+                            ..syn
+                        }
+                    ),
+                    None
+                );
+            }
+            for control in [TcpControl::None, TcpControl::Fin, TcpControl::Rst] {
+                assert_eq!(s.time_wait_reuse(&ip, &TcpRepr { control, ..syn }), None);
+            }
+            assert_eq!(
+                s.time_wait_reuse(
+                    &ip,
+                    &TcpRepr {
+                        ack_number: Some(LOCAL_SEQ),
+                        ..syn
+                    }
+                ),
+                None
+            );
+            assert_eq!(
+                s.time_wait_reuse(
+                    &ip,
+                    &TcpRepr {
+                        payload: b"old",
+                        ..syn
+                    }
+                ),
+                None
+            );
+            assert_eq!(
+                s.time_wait_reuse(
+                    &ip,
+                    &TcpRepr {
+                        src_port: REMOTE_PORT + 1,
+                        ..syn
+                    }
+                ),
+                None
+            );
+            let other = IpRepr::new(
+                OTHER_ADDR.into(),
+                LOCAL_ADDR.into(),
+                IpProtocol::Tcp,
+                20,
+                64,
+            );
+            assert_eq!(s.time_wait_reuse(&other, &syn), None);
+            assert_eq!(s.state, State::TimeWait);
+            assert_eq!(s.timer, timer);
+
+            s.state = State::Established;
+            assert_eq!(s.time_wait_reuse(&ip, &syn), None);
+        }
+    }
+
+    #[test]
+    fn test_time_wait_reuse_waits_for_unread_fin_payload() {
+        let mut s = socket_fin_wait_2();
+        send!(s, time 1_000, TcpRepr {
+            control: TcpControl::Fin,
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 2),
+            payload: b"last",
+            ..SEND_TEMPL
+        });
+        assert_eq!(s.state, State::TimeWait);
+        let ip = IpRepr::new(
+            REMOTE_ADDR.into(),
+            LOCAL_ADDR.into(),
+            IpProtocol::Tcp,
+            20,
+            64,
+        );
+        let syn = TcpRepr {
+            control: TcpControl::Syn,
+            seq_number: REMOTE_SEQ + 65536,
+            ack_number: None,
+            ..SEND_TEMPL
+        };
+        assert_eq!(s.time_wait_reuse(&ip, &syn), None);
+        let mut bytes = [0; 4];
+        assert_eq!(s.recv_slice(&mut bytes), Ok(4));
+        assert_eq!(&bytes, b"last");
+        assert_eq!(s.time_wait_reuse(&ip, &syn), Some(LOCAL_SEQ + 3));
+    }
 
     #[test]
     fn test_time_wait_from_fin_wait_2_ack() {
