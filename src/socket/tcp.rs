@@ -1352,6 +1352,16 @@ impl<'a, B: Buffer> Socket<'a, B> {
         Ok(())
     }
 
+    /// Configure storage metadata for the next input call, for example an owned
+    /// backing frame. The callback must not alter logical bytes or capacity.
+    pub fn receive_context(&mut self, configure: impl FnOnce(&mut B)) {
+        let length = self.rx_buffer.len();
+        let capacity = self.rx_buffer.capacity();
+        configure(&mut self.rx_buffer);
+        debug_assert_eq!(self.rx_buffer.len(), length);
+        debug_assert_eq!(self.rx_buffer.capacity(), capacity);
+    }
+
     /// Consume through custom storage, returning exactly the number removed.
     /// The callback must preserve unconsumed and out-of-order bytes.
     pub fn recv_buffer<'b, F, R>(&'b mut self, f: F) -> Result<R, RecvError>
