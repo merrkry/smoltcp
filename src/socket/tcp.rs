@@ -2474,11 +2474,9 @@ impl<'a, B: Buffer> Socket<'a, B> {
     /// <https://elixir.bootlin.com/linux/v6.9.9/source/net/ipv4/tcp.c#L1472>.
     fn window_to_update(&self) -> bool {
         match self.state {
-            State::SynSent
-            | State::SynReceived
-            | State::Established
-            | State::FinWait1
-            | State::FinWait2 => {
+            // SYN windows cannot use scaling. A larger receive buffer must wait
+            // for establishment instead of repeatedly retransmitting SYN-ACK.
+            State::Established | State::FinWait1 | State::FinWait2 => {
                 let new_win = self.scaled_window();
                 if let Some(last_win) = self.last_scaled_window() {
                     new_win > 0 && new_win / 2 >= last_win
@@ -3951,6 +3949,41 @@ mod test {
             );
             assert_eq!(s.remote_win_scale, Some(scale));
         }
+    }
+
+    #[test]
+    fn test_window_growth_waits_for_handshake_completion() {
+        let mut s = socket_syn_received();
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: LOCAL_SEQ,
+                ack_number: Some(REMOTE_SEQ + 1),
+                max_seg_size: Some(BASE_MSS),
+                ..RECV_TEMPL
+            }]
+        );
+
+        s.rx_buffer = SocketBuffer::new(vec![0; 256]);
+        recv!(s, []);
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                window_len: 256,
+                ..RECV_TEMPL
+            }]
+        );
     }
 
     #[test]
