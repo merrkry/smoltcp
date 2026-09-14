@@ -2484,11 +2484,47 @@ impl<'a, B: Buffer> Socket<'a, B> {
     where
         F: FnOnce(&mut C, PacketMeta, (IpRepr, TcpRepr)) -> Result<(), E>,
     {
+        self.dispatch_payload(cx, |cx, meta, (ip, mut tcp), buffer, range| {
+            if !range.is_empty() {
+                tcp.payload = buffer.get_segment(range.start, range.len());
+            }
+            emit(cx, meta, (ip, tcp))
+        })
+    }
+
+    /// Dispatch headers and a logical TX range without gathering payload. The
+    /// callback must retain its own storage views before returning success.
+    /// IP length includes the range; TCP payload holds only synthetic probe data.
+    pub fn dispatch_scattered<C: TcpContext, F, E>(&mut self, cx: &mut C, emit: F) -> Result<(), E>
+    where
+        F: FnOnce(
+            &mut C,
+            PacketMeta,
+            (IpRepr, TcpRepr),
+            &B,
+            core::ops::Range<usize>,
+        ) -> Result<(), E>,
+    {
+        self.dispatch_payload(cx, |cx, meta, repr, buffer, range| {
+            emit(cx, meta, repr, buffer, range)
+        })
+    }
+
+    fn dispatch_payload<C: TcpContext, F, E>(&mut self, cx: &mut C, emit: F) -> Result<(), E>
+    where
+        F: FnOnce(
+            &mut C,
+            PacketMeta,
+            (IpRepr, TcpRepr),
+            &mut B,
+            core::ops::Range<usize>,
+        ) -> Result<(), E>,
+    {
         if self.tuple.is_none() {
             return Ok(());
         }
 
-        // NOTE(unwrap): we check tuple is not None above.
+        // SAFETY: The early return above excludes an absent tuple.
         let tuple = self.tuple.unwrap();
 
         // Check if the interface still has our source IP address.
@@ -2625,7 +2661,9 @@ impl<'a, B: Buffer> Socket<'a, B> {
             payload: &[],
         };
 
+        let mut payload = 0..0;
         let mut is_zero_window_probe = false;
+        let mut fast_retransmit = false;
 
         #[cfg_attr(
             not(feature = "segmentation-offload"),
@@ -2685,9 +2723,9 @@ impl<'a, B: Buffer> Socket<'a, B> {
                 let offset = if self.pending_fast_retransmit {
                     let size = effective_mss.min(self.tx_buffer.len());
                     repr.seq_number = self.local_seq_no;
-                    repr.payload = self.tx_buffer.get_segment(0, size);
+                    payload = 0..self.tx_buffer.segment_len(0, size);
 
-                    self.pending_fast_retransmit = false;
+                    fast_retransmit = true;
 
                     0
                 } else {
@@ -2757,10 +2795,10 @@ impl<'a, B: Buffer> Socket<'a, B> {
                     };
 
                     let offset = self.flight_size();
-                    repr.payload = self.tx_buffer.get_segment(offset, size);
+                    payload = offset..offset + self.tx_buffer.segment_len(offset, size);
 
                     #[cfg(feature = "segmentation-offload")]
-                    if repr.payload.len() > effective_mss {
+                    if (repr.payload.len() + payload.len()) > effective_mss {
                         packet_meta.segmentation_offload_size =
                             core::num::NonZeroU16::try_from(u16::try_from(effective_mss).unwrap())
                                 .unwrap()
@@ -2772,12 +2810,14 @@ impl<'a, B: Buffer> Socket<'a, B> {
 
                 // If we've sent everything we had in the buffer, follow it with the PSH or FIN
                 // flags, depending on whether the transmit half of the connection is open.
-                if offset + repr.payload.len() == queued_bytes {
+                if offset + (repr.payload.len() + payload.len()) == queued_bytes {
                     match self.state {
                         State::FinWait1 | State::LastAck | State::Closing => {
                             repr.control = TcpControl::Fin
                         }
-                        State::Established | State::CloseWait if !repr.payload.is_empty() => {
+                        State::Established | State::CloseWait
+                            if !(repr.payload.is_empty() && payload.is_empty()) =>
+                        {
                             repr.control = TcpControl::Psh
                         }
                         _ => (),
@@ -2794,7 +2834,7 @@ impl<'a, B: Buffer> Socket<'a, B> {
         // sequence space will elicit an ACK, we only need to send an explicit packet if we
         // couldn't fill the sequence space with anything.
         let is_keep_alive;
-        if self.timer.should_keep_alive(cx.now()) && repr.is_empty() {
+        if self.timer.should_keep_alive(cx.now()) && repr.is_empty() && payload.is_empty() {
             repr.seq_number = repr.seq_number - 1;
             repr.payload = b"\x00"; // RFC 1122 says we should do this
             is_keep_alive = true;
@@ -2805,14 +2845,14 @@ impl<'a, B: Buffer> Socket<'a, B> {
         // Trace a summary of what will be sent.
         if is_keep_alive {
             tcp_trace!("sending a keep-alive");
-        } else if !repr.payload.is_empty() {
+        } else if !(repr.payload.is_empty() && payload.is_empty()) {
             tcp_trace!(
                 "tx buffer: sending {} octets at offset {}",
-                repr.payload.len(),
+                (repr.payload.len() + payload.len()),
                 self.remote_last_seq - self.local_seq_no
             );
         }
-        if repr.control != TcpControl::None || repr.payload.is_empty() {
+        if repr.control != TcpControl::None || (repr.payload.is_empty() && payload.is_empty()) {
             let flags = match (repr.control, repr.ack_number) {
                 (TcpControl::Syn, None) => "SYN",
                 (TcpControl::Syn, Some(_)) => "SYN|ACK",
@@ -2838,8 +2878,19 @@ impl<'a, B: Buffer> Socket<'a, B> {
         // Bailing out if the packet isn't placed in the device buffer allows us
         // to not waste time waiting for the retransmit timer on packets that we know
         // for sure will not be successfully transmitted.
-        ip_repr.set_payload_len(repr.buffer_len());
-        emit(cx, packet_meta, (ip_repr, repr))?;
+        let segment_len = repr.segment_len() + payload.len();
+        ip_repr.set_payload_len(repr.buffer_len() + payload.len());
+        emit(
+            cx,
+            packet_meta,
+            (ip_repr, repr),
+            &mut self.tx_buffer,
+            payload,
+        )?;
+
+        if fast_retransmit {
+            self.pending_fast_retransmit = false;
+        }
 
         // We've sent something, whether useful data or a keep-alive packet, so rewind
         // the keep-alive timer.
@@ -2872,9 +2923,7 @@ impl<'a, B: Buffer> Socket<'a, B> {
         // We've sent a packet successfully, so we can update the internal state now.
         // Use max() so a fast-retransmit segment (whose seq_number is local_seq_no, well
         // behind the current frontier) doesn't rewind the tracked "highest sent" sequence.
-        self.remote_last_seq = self
-            .remote_last_seq
-            .max(repr.seq_number + repr.segment_len());
+        self.remote_last_seq = self.remote_last_seq.max(repr.seq_number + segment_len);
         self.remote_last_ack = repr.ack_number;
         if self.rx_buffer.window_shift().is_some()
             && let Some(ack) = repr.ack_number
@@ -2896,15 +2945,14 @@ impl<'a, B: Buffer> Socket<'a, B> {
                 repr.window_len
             };
 
-        if repr.segment_len() > 0 {
-            self.rtte
-                .on_send(cx.now(), repr.seq_number + repr.segment_len());
+        if segment_len > 0 {
+            self.rtte.on_send(cx.now(), repr.seq_number + segment_len);
             self.congestion_controller
                 .inner_mut()
-                .post_transmit(cx.now(), repr.segment_len());
+                .post_transmit(cx.now(), segment_len);
         }
 
-        if repr.segment_len() > 0 && !self.timer.is_retransmit() {
+        if segment_len > 0 && !self.timer.is_retransmit() {
             // RFC 6298 (5.1) Every time a packet containing data is sent (including a
             // retransmission), if the timer is not running, start it running
             // so that it will expire after RTO seconds.

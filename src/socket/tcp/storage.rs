@@ -26,6 +26,9 @@ pub trait Buffer {
     fn get_allocated(&self, offset: usize, size: usize) -> &[u8];
     /// Prepare one wire segment. Segmented storage can join a block boundary
     /// here so allocation layout does not produce short TCP segments.
+    fn segment_len(&self, offset: usize, size: usize) -> usize {
+        self.get_allocated(offset, size).len()
+    }
     fn get_segment(&mut self, offset: usize, size: usize) -> &[u8] {
         self.get_allocated(offset, size)
     }
